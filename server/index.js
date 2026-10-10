@@ -29,12 +29,14 @@ const NUZLOCKE_STATE_PATH = path.join(PROJECT_ROOT, '.game', 'nuzlocke-state.jso
 const ADAPTERS = new Map([
   ['radical-red', require(path.join(PROJECT_ROOT, 'adapters', 'radical-red'))],
   ['rnb', require(path.join(PROJECT_ROOT, 'adapters', 'rnb'))],
+  ['quicksilver-fc', require(path.join(PROJECT_ROOT, 'adapters', 'quicksilver-fc'))],
 ]);
 const DEFAULT_ADAPTER_ID = process.env.ADAPTER_ID || 'radical-red';
 
 // Route an incoming raw payload to the right adapter so two ROMs can be tracked without
 // reconfiguring. A Lua script may tag its payload with `romHack` (authoritative); else we
 // fall back to the GBA game code (FireRed=BPRE → Radical Red, Emerald=BPEE → Run & Bun).
+// 水银FC is also BPRE, so its exporter must send `romHack: "quicksilver-fc"`.
 const ADAPTER_BY_GAME_CODE = { BPRE: 'radical-red', BPEE: 'rnb' };
 
 function resolveAdapterForPayload(payload) {
@@ -200,6 +202,12 @@ function lookupById(records, id) {
   return records ? (records[String(id)] || null) : null;
 }
 
+// ROM-generated data carries the in-game Chinese name; otherwise translate the English one.
+function speciesNameZh(context, speciesId, englishName) {
+  const record = lookupById(context.data.species, speciesId);
+  return record?.nameZh || context.translations.species.get(englishName) || englishName || null;
+}
+
 // ── translation builder ───────────────────────────────────────────────────────
 
 function normalizeName(value) {
@@ -210,7 +218,10 @@ function buildKnownNames(records) {
   const knownNames = new Map();
   for (const record of Object.values(records || {})) {
     const name = getRecordName(record);
-    if (name) knownNames.set(normalizeName(name), name);
+    // Names the ROM data only has in Chinese normalize to '' and would match any
+    // non-English cell; they are already display-ready, so skip translating them.
+    const key = normalizeName(name);
+    if (key) knownNames.set(key, name);
   }
   return knownNames;
 }
@@ -385,13 +396,24 @@ function levelOptionsFromExperience(experience, selectedGrowthRateName = null) {
 
 // Growth rate for any mon (party mons don't carry an inferred growthRateName since
 // their level comes straight from RAM). Mirrors the resolution inside inferLevel.
-function resolveGrowthRateName(mon, growthRateData, adapterId) {
-  if (!growthRateData) return null;
+function resolveGrowthRateName(mon, speciesRecord, growthRateData, adapterId) {
   const overrideName = nuzlockeState?.growthRateOverrides?.[monIdentity(mon, adapterId)] || null;
-  const dexId = mon?.dexId ?? mon?.species;
+  const dexId = speciesRecord?.dexID ?? mon?.dexId ?? mon?.species;
+  return overrideName || defaultGrowthRateName(speciesRecord, dexId, growthRateData);
+}
+
+// Growth-rate index as stored in a FireRed ROM's base stats (pokefirered GROWTH_* order).
+const ROM_GROWTH_RATE_NAMES = ['medium', 'erratic', 'fluctuating', 'medium-slow', 'fast', 'slow'];
+
+// A species' default curve. Adapters whose data.js was generated from the ROM carry
+// `growthRate`, which wins: hacks rebalance curves (水银FC makes pseudo-legendaries
+// medium-slow) and add species pokeapi doesn't know. Otherwise use the pokeapi table.
+function defaultGrowthRateName(speciesRecord, dexId, growthRateData) {
+  const fromRom = ROM_GROWTH_RATE_NAMES[speciesRecord?.growthRate];
+  if (fromRom) return fromRom;
+  if (!growthRateData) return null;
   const growthRateId = growthRateData.speciesGrowthRateIds.get(Number(dexId));
-  const defaultGrowthRateName = growthRateData.growthRateNames.get(growthRateId);
-  return overrideName || canonicalGrowthRateName(defaultGrowthRateName) || null;
+  return canonicalGrowthRateName(growthRateData.growthRateNames.get(growthRateId)) || null;
 }
 
 // Find a 32-bit personality whose nature (p % 25) and ability slot bit (p & 1) match
@@ -415,17 +437,15 @@ function personalityForNatureAndAbility(base, nature, abilityBit) {
 }
 
 function inferLevel(mon, speciesRecord, growthRateData, adapterId) {
-  if (!growthRateData || Number.isInteger(mon.level)) return null;
+  if (Number.isInteger(mon.level)) return null;
   const overrideName = nuzlockeState?.growthRateOverrides?.[monIdentity(mon, adapterId)] || null;
-  const dexId = speciesRecord?.dexID ?? mon.species;
-  const growthRateId = growthRateData.speciesGrowthRateIds.get(Number(dexId));
-  const defaultGrowthRateName = growthRateData.growthRateNames.get(growthRateId);
-  const growthRateName = overrideName || canonicalGrowthRateName(defaultGrowthRateName);
+  const speciesDefault = defaultGrowthRateName(speciesRecord, speciesRecord?.dexID ?? mon.species, growthRateData);
+  const growthRateName = overrideName || speciesDefault;
   const level = levelFromExperience(growthRateName, mon.experience);
   return level ? {
     level,
     growthRateName,
-    defaultGrowthRateName,
+    defaultGrowthRateName: speciesDefault,
     growthRateOverride: overrideName,
     levelOptions: levelOptionsFromExperience(mon.experience, growthRateName),
   } : null;
@@ -917,8 +937,11 @@ const httpServer = http.createServer(async (req, res) => {
       const decorate = (move) => {
         const info = context.moveInfo.get(move.name) || null;
         const prefer = (adapterValue, officialValue) => (adapterValue != null ? adapterValue : (officialValue ?? null));
+        const withSpeciesZh = (source) => (source.speciesId != null
+          ? { ...source, speciesNameZh: speciesNameZh(context, source.speciesId, source.speciesName) }
+          : source);
         return {
-          name: move.name,
+          id: move.id ?? null,
           nameZh: info?.nameZh ?? null,
           type: (move.type != null ? (TYPE_NAMES_ZH[move.type] ?? move.type) : null) ?? info?.type ?? null,
           category: (move.category != null ? (MOVE_CATEGORY_ZH[move.category] ?? move.category) : null) ?? info?.category ?? null,
@@ -927,15 +950,25 @@ const httpServer = http.createServer(async (req, res) => {
           pp: prefer(move.pp, info?.pp),
           description: info?.description ?? move.description ?? null,
           ...(move.level != null ? { level: move.level } : {}),
+          ...(move.label != null ? { label: move.label } : {}),
+          ...(move.fromSpeciesId != null ? {
+            fromSpeciesId: move.fromSpeciesId,
+            fromSpeciesName: move.fromSpeciesName,
+            fromSpeciesNameZh: speciesNameZh(context, move.fromSpeciesId, move.fromSpeciesName),
+          } : {}),
+          sources: (move.sources || []).map(withSpeciesZh),
         };
       };
+      const decorateAll = (list) => (Array.isArray(list) ? list.map(decorate) : []);
       sendJson(res, 200, {
         ok: true,
         adapterId: context.adapter.id,
         species: Number(speciesId),
-        levelUpMoves: learnable.levelUpMoves.map(decorate),
-        tmMoves: learnable.tmMoves.map(decorate),
-        tutorMoves: learnable.tutorMoves.map(decorate),
+        levelUpMoves: decorateAll(learnable.levelUpMoves),
+        tmMoves: decorateAll(learnable.tmMoves),
+        tutorMoves: decorateAll(learnable.tutorMoves),
+        eggMoves: decorateAll(learnable.eggMoves),
+        preEvolutionMoves: decorateAll(learnable.preEvolutionMoves),
       });
     } catch (error) {
       sendJson(res, 400, { ok: false, error: error.message });
@@ -1004,6 +1037,49 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // Teach a mon one move it can legally learn (any level-up / TM / tutor / egg / earlier-
+  // stage move, ignoring game progress), replacing the move in `slot` (1-4). PP is filled
+  // to the move's base PP; Lua clears that slot's PP Ups.
+  if (req.method === 'POST' && url.pathname === '/nuzlocke/learn-move') {
+    try {
+      const body = JSON.parse(await readBody(req) || '{}');
+      if (!body.key) throw new Error('Expected { key, moveId, slot }');
+      if (!latestStatus) throw new Error('尚未收到任何状态');
+      const found = findMonByKey(latestStatus, body.key);
+      if (!found) throw new Error('找不到该宝可梦（可能已离开队伍/盒子）');
+      const { mon, isParty } = found;
+      const context = getAdapterContext(latestStatus.adapterId || DEFAULT_ADAPTER_ID);
+
+      const moveId = Number(body.moveId);
+      const learnable = typeof context.adapter.getLearnableMoves === 'function'
+        ? context.adapter.getLearnableMoves(mon.species)
+        : null;
+      const legal = new Set(Object.values(learnable || {}).flatMap((list) => (Array.isArray(list) ? list.map((m) => m.id) : [])));
+      if (!legal.has(moveId)) throw new Error('该招式不在这只宝可梦的可学习列表里');
+
+      const current = [0, 1, 2, 3].map((i) => Number(mon.moves?.[i]) || 0);
+      if (current.includes(moveId)) throw new Error('已经学会这个招式了');
+      let slot = Number(body.slot);
+      if (!Number.isInteger(slot) || slot < 1 || slot > 4) throw new Error('招式格子应为 1-4');
+      // Moves must stay packed at the front: an empty target slot means "first free slot".
+      const firstEmpty = current.indexOf(0);
+      if (current[slot - 1] === 0 && firstEmpty >= 0) slot = firstEmpty + 1;
+      // Boxed mons store each move in 10 bits.
+      if (!isParty && moveId >= 1024) throw new Error('盒子里的宝可梦无法保存编号 ≥1024 的招式');
+
+      const pp = Number(context.data.moves?.[String(moveId)]?.pp) || 0;
+      const parts = [
+        `personality=${mon.personality >>> 0}`, `otId=${mon.otId >>> 0}`,
+        `moveSlot=${slot}`, `moveId=${moveId}`, `movePp=${pp}`,
+      ];
+      const result = await sendEditCommand(parts);
+      sendJson(res, 200, { ok: true, slot, replacedMoveId: current[slot - 1] || null, message: result.message || '' });
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: error.message });
+    }
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/nuzlocke/edit') {
     try {
       const body = JSON.parse(await readBody(req) || '{}');
@@ -1056,7 +1132,8 @@ const httpServer = http.createServer(async (req, res) => {
       let targetLevel = Number.isInteger(mon.level) ? mon.level : null;
       if (changes.level != null) {
         targetLevel = clamp(changes.level, 1, 100, mon.level || 1);
-        const growthRateName = resolveGrowthRateName(mon, context.growthRateData, adapterId);
+        const speciesRecord = lookupById(context.data.species, mon.species);
+        const growthRateName = resolveGrowthRateName(mon, speciesRecord, context.growthRateData, adapterId);
         const exp = expForLevel(growthRateName, targetLevel);
         if (exp == null) throw new Error('无法推断该宝可梦的成长曲线，等级修改已跳过');
         parts.push(`experience=${exp}`);
