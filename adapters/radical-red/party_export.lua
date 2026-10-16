@@ -15,6 +15,10 @@ local AUTO_SAVE_INTERVAL_FRAMES = 60 * 60
 -- Set to false to make the bridge strictly read-only again.
 local ENABLE_REMOTE_EDIT = true
 
+-- Tracker adapter this script feeds. Several FireRed hacks share game code BPRE, so the
+-- payload names its adapter explicitly instead of relying on gameCode.
+local ROM_HACK = "radical-red"
+
 local PARTY_COUNT_ADDRESS = 0x02024029
 local PARTY_ADDRESS = 0x02024284
 local PC_STORAGE_POINTER_ADDRESS = 0x03005010
@@ -143,20 +147,28 @@ local function readUnaligned32(address)
 		| (emu:read8(address + 3) << 24)
 end
 
-local function readPackedMoves(address, countByte)
+-- CFRU's compressed box mon packs its four moves into 5 bytes, 10 bits each. (The byte
+-- just before them is the Poke Ball type, not a move count; empty slots are just 0.)
+local function readPackedMoves(address)
 	local moves = {}
-	local moveCount = countByte + 1
-	if moveCount < 0 or moveCount > 4 then
-		moveCount = 4
-	end
 	for index = 0, 3 do
-		if index < moveCount then
-			moves[index + 1] = readBits(address, index * 10, 10)
-		else
-			moves[index + 1] = 0
-		end
+		moves[index + 1] = readBits(address, index * 10, 10)
 	end
 	return moves
+end
+
+local function writeBits(address, bitOffset, bitCount, value)
+	for bit = 0, bitCount - 1 do
+		local byteAddress = address + ((bitOffset + bit) >> 3)
+		local mask = 1 << ((bitOffset + bit) & 7)
+		local byte = emu:read8(byteAddress)
+		if (value >> bit) & 1 == 1 then
+			byte = byte | mask
+		else
+			byte = byte & ~mask
+		end
+		emu:write8(byteAddress, byte & 0xFF)
+	end
 end
 
 local function calculateBoxChecksum(address, key)
@@ -316,7 +328,7 @@ local function readPcMon(address)
 		experience = readUnaligned32(address + 32),
 		ppBonuses = emu:read8(address + 36),
 		friendship = emu:read8(address + 37),
-		moves = readPackedMoves(address + 39, emu:read8(address + 38)),
+		moves = readPackedMoves(address + 39),
 		pp = {0, 0, 0, 0},
 		ppEstimated = true,
 		pokerus = emu:read8(address + 50),
@@ -580,7 +592,8 @@ local function statusToJson(party, pc)
 	for index, mon in ipairs(party) do
 		mons[index] = monToJson(mon)
 	end
-	return string.format('{"source":"mgba","gameCode":"%s","frame":%d,"partyCount":%d,"party":[%s],"pc":%s}',
+	return string.format('{"source":"mgba","romHack":"%s","gameCode":"%s","frame":%d,"partyCount":%d,"party":[%s],"pc":%s}',
+		jsonEscape(ROM_HACK),
 		jsonEscape(emu:getGameCode() or ""),
 		frameCounter,
 		#party,
@@ -725,6 +738,19 @@ local function applyEditParty(address, fields)
 	local friendship = fieldNumber(fields, "friendship")
 	if friendship then growth[3] = (growth[3] & 0xFFFF00FF) | ((friendship & 0xFF) << 8) end
 
+	-- Teach a move: attacks holds moves 1-2 / 3-4 as u16 pairs, then the four PP bytes.
+	-- A new move starts without PP Ups (2 bits per slot in growth's ppBonuses byte).
+	local moveSlot = fieldNumber(fields, "moveSlot")
+	if moveSlot and moveSlot >= 1 and moveSlot <= 4 then
+		local moveId = (fieldNumber(fields, "moveId") or 0) & 0xFFFF
+		local word = moveSlot <= 2 and 1 or 2
+		local shift = ((moveSlot - 1) % 2) * 16
+		attacks[word] = (attacks[word] & ~(0xFFFF << shift)) | (moveId << shift)
+		local ppShift = (moveSlot - 1) * 8
+		attacks[3] = (attacks[3] & ~(0xFF << ppShift)) | (((fieldNumber(fields, "movePp") or 0) & 0xFF) << ppShift)
+		growth[3] = growth[3] & ~(0x3 << ((moveSlot - 1) * 2))
+	end
+
 	if fields.evHp then
 		evs[1] = (fieldNumber(fields, "evHp") & 0xFF)
 			| ((fieldNumber(fields, "evAtk") & 0xFF) << 8)
@@ -818,6 +844,16 @@ local function applyEditPc(address, fields)
 
 	local friendship = fieldNumber(fields, "friendship")
 	if friendship then emu:write8(address + 37, friendship & 0xFF) end
+
+	-- Teach a move: 10-bit packed moves at +39. Boxed mons store no PP (it is refilled on
+	-- withdrawal), so only the PP Ups for that slot (ppBonuses at +36) are cleared.
+	local moveSlot = fieldNumber(fields, "moveSlot")
+	if moveSlot and moveSlot >= 1 and moveSlot <= 4 then
+		local moveId = fieldNumber(fields, "moveId") or 0
+		if moveId >= 1024 then error("move id does not fit a boxed mon", 0) end
+		writeBits(address + 39, (moveSlot - 1) * 10, 10, moveId)
+		emu:write8(address + 36, emu:read8(address + 36) & ~(0x3 << ((moveSlot - 1) * 2)) & 0xFF)
+	end
 
 	if fields.evHp then
 		emu:write8(address + 44, fieldNumber(fields, "evHp") & 0xFF)

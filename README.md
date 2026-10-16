@@ -101,6 +101,8 @@ Nuzlocke 主页面。
 
 右上角有 Roll 点工具，输入数字 `N` 后点击 `Roll`，会随机返回 `1 ~ N` 的整数。
 
+右键宝可梦选「查看技能」，可以看到它不论游戏进度、合法情况下能学的全部招式：升级、招式学习器、教学、遗传，以及进化前形态的升级招式。每个招式都用标签标出所有来源。点「学习」再点上方「当前招式」里的一个格子，就会直接写入 mGBA（PP 补满，同行和盒子里的宝可梦都可以）。
+
 ### `/obs`
 
 ```text
@@ -159,6 +161,27 @@ server 会为宝可梦生成 `spriteUrl`：
 ```text
 http://127.0.0.1:8787/sprite?adapterId=radical-red&species=19
 ```
+
+### 宝可梦水银FC（`quicksilver-fc`）
+
+水银FC 和 Radical Red 一样是 CFRU 框架，内存布局相同。玩水银FC 时在 mGBA 里加载：
+
+```text
+adapters/quicksilver-fc/party_export.lua
+```
+
+它和 Radical Red 的脚本只差顶部的 `ROM_HACK`。两个 ROM 的 game code 都是 `BPRE`，server 靠这个字段决定用哪套数据。
+
+`adapters/quicksilver-fc/data/data.js` 和 `mapsec_table.json` 是从 ROM 直接生成的（种族值、属性、特性、成长曲线、招式、升级 / 招式学习器 / 教学 / 遗传招式、进化、地图名）。ROM 更新后重新生成：
+
+```powershell
+node adapters/quicksilver-fc/build-data.js ".game/宝可梦水银FC~致150年后的你+Version1.33.gba"
+```
+
+已知限制：
+
+- 英文名、sprite 借用 Radical Red 的数据（按全国图鉴号 + 属性 / 种族值匹配），水银FC 独有的形态和招式 / 特性直接显示 ROM 里的中文名，部分没有 sprite
+- 道具表在 ROM 里做了混淆，携带道具名暂时沿用 Radical Red 的道具 ID，hack 新增 / 改动的道具可能显示不准
 
 ## 常见问题
 
